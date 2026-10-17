@@ -169,7 +169,7 @@ class AddSongModal(discord.ui.Modal, title="🎵 새 곡 추가하기"):
                 item['requester'] = interaction.user
                 self.music_state.queue.append(item)
 
-            if not self.music_state.is_playing:
+            if not self.music_state.is_actively_playing:
                 await interaction.followup.send(
                     f"재생목록 {result.get('playlist_title')} (총 {len(items)}곡) 재생을 시작합니다.",
                     ephemeral=True
@@ -185,7 +185,7 @@ class AddSongModal(discord.ui.Modal, title="🎵 새 곡 추가하기"):
         song_info = result
         song_info['requester'] = interaction.user
 
-        if self.music_state.is_playing:
+        if self.music_state.is_actively_playing:
             self.music_state.queue.append(song_info)
             embed = discord.Embed(
                 title=f"📥 대기열 추가: {song_info['title']}",
@@ -536,6 +536,15 @@ class GuildMusicState:
         self.playback_paused_duration: float = 0.0
         self.is_seeking: bool = False
 
+    @property
+    def is_actively_playing(self) -> bool:
+        return bool(
+            self.voice_client
+            and self.voice_client.is_connected()
+            and (self.voice_client.is_playing() or self.voice_client.is_paused())
+            and self.current is not None
+        )
+
     def get_current_position(self) -> int:
         if not self.is_playing or self.playback_start_time == 0:
             return 0
@@ -762,11 +771,22 @@ class GuildMusicState:
             if not self.voice_client or not self.voice_client.is_connected():
                 self.is_playing = False
                 self.current = None
+                if initial_interaction and not initial_interaction.is_expired():
+                    try:
+                        await initial_interaction.followup.send("음성 채널에 연결되어 있지 않습니다.")
+                    except Exception:
+                        pass
                 return
 
             if self.voice_client.is_playing() or self.voice_client.is_paused():
-                self.voice_client.stop()
-                await asyncio.sleep(0.25)
+                try:
+                    self.voice_client.stop()
+                except Exception:
+                    pass
+                for _ in range(15):
+                    if not self.voice_client.is_playing():
+                        break
+                    await asyncio.sleep(0.1)
 
             if not self.queue:
                 was_playing = self.is_playing
@@ -775,6 +795,11 @@ class GuildMusicState:
                 if was_playing and self.text_channel:
                     try:
                         await self.text_channel.send("✨ 모든 대기열의 곡 재생이 완료되었습니다. (3분 뒤 자동 퇴장)")
+                    except Exception:
+                        pass
+                if initial_interaction and not initial_interaction.is_expired():
+                    try:
+                        await initial_interaction.followup.send("대기열이 비어 있습니다.")
                     except Exception:
                         pass
                 self.start_inactivity_timer()
@@ -786,23 +811,27 @@ class GuildMusicState:
             self.current = next_song
 
             try:
-                if not next_song.get('stream_url'):
-                    yt_res = await get_youtube_info(next_song['webpage_url'])
+                stream_url = next_song.get('stream_url')
+                if not stream_url:
+                    yt_res = await get_youtube_info(next_song.get('webpage_url') or next_song.get('source_url'))
                     if yt_res and yt_res.get('stream_url'):
-                        next_song['stream_url'] = yt_res['stream_url']
+                        stream_url = yt_res['stream_url']
+                        next_song['stream_url'] = stream_url
                         if not next_song.get('thumbnail') and yt_res.get('thumbnail'):
                             next_song['thumbnail'] = yt_res['thumbnail']
                     else:
-                        raise Exception("스트림 URL 추출 실패")
+                        raise Exception("스트림 URL을 가져올 수 없습니다.")
 
                 source = discord.FFmpegPCMAudio(
-                    next_song['stream_url'],
+                    stream_url,
                     executable=FFMPEG_EXECUTABLE,
                     **FFMPEG_OPTIONS
                 )
                 audio = discord.PCMVolumeTransformer(source, volume=0.8)
 
                 def after_playing(error):
+                    if error:
+                        logging.getLogger("discord.client").error(f"FFmpeg 재생 오류: {error}")
                     if self.is_seeking:
                         return
                     asyncio.run_coroutine_threadsafe(self.play_next(), self.bot.loop)
@@ -826,21 +855,49 @@ class GuildMusicState:
                         self.current_controller_msg = None
 
                 if not updated:
-                    if initial_interaction:
-                        self.current_controller_msg = await initial_interaction.followup.send(embed=embed, view=view)
-                    elif self.text_channel:
-                        self.current_controller_msg = await self.text_channel.send(embed=embed, view=view)
+                    if initial_interaction and not initial_interaction.is_expired():
+                        try:
+                            self.current_controller_msg = await initial_interaction.followup.send(embed=embed, view=view)
+                            updated = True
+                        except Exception:
+                            pass
+                    if not updated and self.text_channel:
+                        try:
+                            self.current_controller_msg = await self.text_channel.send(embed=embed, view=view)
+                        except Exception:
+                            pass
+                elif initial_interaction and not initial_interaction.is_expired():
+                    try:
+                        await initial_interaction.delete_original_response()
+                    except Exception:
+                        pass
 
                 self.start_progress_updater()
 
-            except Exception:
-                if self.text_channel:
+            except Exception as e:
+                logging.getLogger("discord.client").exception(f"{next_song.get('title')} 재생 처리 중 오류 발생")
+                err_text = f"{next_song.get('title')} 재생에 실패했습니다: {e}"
+                if initial_interaction and not initial_interaction.is_expired():
                     try:
-                        await self.text_channel.send(f"{next_song['title']} 재생에 실패했습니다.")
+                        await initial_interaction.followup.send(err_text)
+                    except Exception:
+                        if self.text_channel:
+                            try:
+                                await self.text_channel.send(err_text)
+                            except Exception:
+                                pass
+                elif self.text_channel:
+                    try:
+                        await self.text_channel.send(err_text)
                     except Exception:
                         pass
-                await asyncio.sleep(0.5)
-                await self.play_next()
+
+                self.is_playing = False
+                self.current = None
+                if self.queue:
+                    asyncio.create_task(self.play_next())
+                else:
+                    self.start_inactivity_timer()
 
 class BotWorker:
     def __init__(self, token: str, is_master: bool = False):
@@ -898,81 +955,98 @@ def setup_master_slash_commands(master_worker: BotWorker):
 
         await interaction.response.defer()
 
-        active_pair = find_active_worker_for_channel(guild.id, user_channel.id)
-        if active_pair:
-            worker, state = active_pair
-        else:
-            idle_pair = find_idle_worker(guild.id)
-            if not idle_pair:
-                await interaction.followup.send(
-                    f"현재 서버의 모든 음악 봇(총 {len(bot_pool)}대)이 다른 음성 채널에서 사용 중입니다.\n"
-                    "다른 채널의 재생이 끝난 후 다시 시도해 주세요."
-                )
+        worker = None
+        state = None
+        try:
+            active_pair = find_active_worker_for_channel(guild.id, user_channel.id)
+            if active_pair:
+                worker, state = active_pair
+            else:
+                idle_pair = find_idle_worker(guild.id)
+                if not idle_pair:
+                    await interaction.followup.send(
+                        f"현재 서버의 모든 음악 봇(총 {len(bot_pool)}대)이 다른 음성 채널에서 사용 중입니다.\n"
+                        "다른 채널의 재생이 끝난 후 다시 시도해 주세요."
+                    )
+                    return
+                worker, state = idle_pair
+
+                try:
+                    state.reset_state()
+                    target_channel = worker.bot.get_channel(user_channel.id)
+                    if not target_channel:
+                        try:
+                            target_channel = await worker.bot.fetch_channel(user_channel.id)
+                        except Exception:
+                            target_channel = user_channel
+                    state.voice_client = await target_channel.connect()
+                except Exception as e:
+                    await interaction.followup.send(f"음성 채널 접속 실패: {e}")
+                    return
+
+            state.text_channel = interaction.channel
+
+            if password and password.strip():
+                state.password = password.strip()
+                state.authenticated_users.add(interaction.user.id)
+
+            result = await resolve_music(query)
+            if not result:
+                await interaction.followup.send(f"'{query}' 에 대한 음악을 찾을 수 없습니다.")
+                if not state.is_actively_playing and not state.queue:
+                    await state.disconnect()
                 return
-            worker, state = idle_pair
 
-            try:
-                state.reset_state()
-                target_channel = worker.bot.get_channel(user_channel.id)
-                if not target_channel:
-                    try:
-                        target_channel = await worker.bot.fetch_channel(user_channel.id)
-                    except Exception:
-                        target_channel = user_channel
-                state.voice_client = await target_channel.connect()
-            except Exception as e:
-                await interaction.followup.send(f"음성 채널 접속 실패: {e}")
+            if result.get('is_playlist'):
+                items = result.get('items', [])
+                for item in items:
+                    item['requester'] = interaction.user
+                    state.queue.append(item)
+
+                if state.is_actively_playing:
+                    embed = discord.Embed(
+                        title=f"📑 재생목록 대기열 추가: {result.get('playlist_title')}",
+                        color=discord.Color.gold(),
+                        description=f"총 {len(items)}곡이 대기열에 순차적으로 추가되었습니다.\n🤖 담당 봇: {worker.bot.user.name}"
+                    )
+                    if items and items[0].get('thumbnail'):
+                        embed.set_thumbnail(url=items[0]['thumbnail'])
+                    await interaction.followup.send(embed=embed)
+                else:
+                    asyncio.create_task(state.play_next(initial_interaction=interaction))
                 return
 
-        state.text_channel = interaction.channel
+            song_info = result
+            song_info['requester'] = interaction.user
 
-        if password and password.strip():
-            state.password = password.strip()
-            state.authenticated_users.add(interaction.user.id)
-
-        result = await resolve_music(query)
-        if not result:
-            await interaction.followup.send(f"'{query}' 에 대한 음악을 찾을 수 없습니다.")
-            return
-
-        if result.get('is_playlist'):
-            items = result.get('items', [])
-            for item in items:
-                item['requester'] = interaction.user
-                state.queue.append(item)
-
-            if state.is_playing:
+            if state.is_actively_playing:
+                state.queue.append(song_info)
                 embed = discord.Embed(
-                    title=f"📑 재생목록 대기열 추가: {result.get('playlist_title')}",
-                    color=discord.Color.gold(),
-                    description=f"총 {len(items)}곡이 대기열에 순차적으로 추가되었습니다.\n🤖 담당 봇: {worker.bot.user.name}"
+                    title=f"📥 대기열 추가: {song_info['title']}",
+                    url=song_info.get('webpage_url') or song_info.get('source_url'),
+                    color=PLATFORM_COLORS.get(song_info.get('platform'), discord.Color.blue())
                 )
-                if items and items[0].get('thumbnail'):
-                    embed.set_thumbnail(url=items[0]['thumbnail'])
+                embed.add_field(name="🎧 플랫폼", value=song_info.get('platform', 'Unknown'), inline=True)
+                embed.add_field(name="🔢 대기 번호", value=f"{len(state.queue)}번째", inline=True)
+                embed.add_field(name="🤖 담당 봇", value=f"{worker.bot.user.name}", inline=True)
+                if song_info.get('thumbnail'):
+                    embed.set_thumbnail(url=song_info['thumbnail'])
                 await interaction.followup.send(embed=embed)
             else:
+                state.queue.append(song_info)
                 asyncio.create_task(state.play_next(initial_interaction=interaction))
-            return
 
-        song_info = result
-        song_info['requester'] = interaction.user
-
-        if state.is_playing:
-            state.queue.append(song_info)
-            embed = discord.Embed(
-                title=f"📥 대기열 추가: {song_info['title']}",
-                url=song_info.get('webpage_url') or song_info.get('source_url'),
-                color=PLATFORM_COLORS.get(song_info.get('platform'), discord.Color.blue())
-            )
-            embed.add_field(name="🎧 플랫폼", value=song_info.get('platform', 'Unknown'), inline=True)
-            embed.add_field(name="🔢 대기 번호", value=f"{len(state.queue)}번째", inline=True)
-            embed.add_field(name="🤖 담당 봇", value=f"{worker.bot.user.name}", inline=True)
-            if song_info.get('thumbnail'):
-                embed.set_thumbnail(url=song_info['thumbnail'])
-            await interaction.followup.send(embed=embed)
-        else:
-            state.queue.append(song_info)
-            asyncio.create_task(state.play_next(initial_interaction=interaction))
+        except Exception as e:
+            logging.getLogger("discord.client").exception("slash_play 처리 중 오류 발생")
+            try:
+                await interaction.followup.send(f"명령어 처리 중 오류가 발생했습니다: {e}")
+            except Exception:
+                pass
+            if state and not state.is_actively_playing and not state.queue:
+                try:
+                    await state.disconnect()
+                except Exception:
+                    pass
 
 async def start_bot_pool():
     if not DISCORD_TOKENS:
